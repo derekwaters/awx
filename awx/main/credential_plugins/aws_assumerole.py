@@ -44,7 +44,7 @@ assume_role_inputs = {
             'id': 'identifier',
             'label': 'Identifier',
             'type': 'string',
-            'help_text': _('The name of the key in the assumed AWS' + ' role to fetch [AccessKeyId | SecretAccessKey | SessionToken].'),
+            'help_text': _('The name of the key in the assumed AWS role to fetch [AccessKeyId | SecretAccessKey | SessionToken].'),
         },
     ],
     'required': ['role_arn'],
