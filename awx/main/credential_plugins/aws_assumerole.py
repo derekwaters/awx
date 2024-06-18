@@ -80,7 +80,10 @@ def aws_assumerole_backend(**kwargs):
         else:
             # Connect to AWS using provided credentials
             connection = boto3.client(service_name="sts", aws_access_key_id=access_key, aws_secret_access_key=secret_key)
-        response = connection.assume_role(RoleArn=role_arn, RoleSessionName='AAP_AWS_Role_Session1', ExternalId=external_id)
+        try:
+            response = connection.assume_role(RoleArn=role_arn, RoleSessionName='AAP_AWS_Role_Session1', ExternalId=external_id)
+        except ClientError as ce:
+            raise ValueError(f'Got a bad client response from AWS: {ce.msg}.')
 
         credentials = response.get("Credentials", {})
 
