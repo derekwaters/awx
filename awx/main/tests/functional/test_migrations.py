@@ -1,6 +1,7 @@
 import pytest
 
 from django_test_migrations.plan import all_migrations, nodes_to_tuples
+from django.utils.timezone import now
 
 """
 Most tests that live in here can probably be deleted at some point. They are mainly
@@ -42,3 +43,45 @@ class TestMigrationSmoke:
         final_state = migrator.apply_tested_migration(final_migration)
         Instance = final_state.apps.get_model('main', 'Instance')
         assert Instance.objects.filter(hostname='foobar').count() == 1
+
+    def test_receptor_address(self, migrator):
+        old_state = migrator.apply_initial_migration(('main', '0188_add_bitbucket_dc_webhook'))
+        Instance = old_state.apps.get_model('main', 'Instance')
+        for i in range(3):
+            Instance.objects.create(hostname=f'foobar{i}', node_type='hop')
+        foo = Instance.objects.create(hostname='foo', node_type='execution', listener_port=1234)
+        bar = Instance.objects.create(hostname='bar', node_type='execution', listener_port=None)
+        bar.peers.add(foo)
+
+        new_state = migrator.apply_tested_migration(
+            ('main', '0189_inbound_hop_nodes'),
+        )
+        Instance = new_state.apps.get_model('main', 'Instance')
+        ReceptorAddress = new_state.apps.get_model('main', 'ReceptorAddress')
+
+        # We can now test how our migration worked, new field is there:
+        assert ReceptorAddress.objects.filter(address='foo', port=1234).count() == 1
+        assert not ReceptorAddress.objects.filter(address='bar').exists()
+
+        bar = Instance.objects.get(hostname='bar')
+        fooaddr = ReceptorAddress.objects.get(address='foo')
+
+        bar_peers = bar.peers.all()
+        assert len(bar_peers) == 1
+        assert fooaddr in bar_peers
+
+    def test_migrate_DAB_RBAC(self, migrator):
+        old_state = migrator.apply_initial_migration(('main', '0190_alter_inventorysource_source_and_more'))
+        Organization = old_state.apps.get_model('main', 'Organization')
+        User = old_state.apps.get_model('auth', 'User')
+
+        org = Organization.objects.create(name='arbitrary-org', created=now(), modified=now())
+        user = User.objects.create(username='random-user')
+        org.read_role.members.add(user)
+
+        new_state = migrator.apply_tested_migration(
+            ('main', '0192_custom_roles'),
+        )
+
+        RoleUserAssignment = new_state.apps.get_model('dab_rbac', 'RoleUserAssignment')
+        assert RoleUserAssignment.objects.filter(user=user.id, object_id=org.id).exists()

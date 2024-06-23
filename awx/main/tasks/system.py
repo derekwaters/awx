@@ -6,6 +6,7 @@ import itertools
 import json
 import logging
 import os
+import psycopg
 from io import StringIO
 from contextlib import redirect_stdout
 import shutil
@@ -35,6 +36,9 @@ import ansible_runner.cleanup
 # dateutil
 from dateutil.parser import parse as parse_date
 
+# django-ansible-base
+from ansible_base.resource_registry.tasks.sync import SyncExecutor
+
 # AWX
 from awx import __version__ as awx_application_version
 from awx.main.access import access_registry
@@ -62,7 +66,7 @@ from awx.main.tasks.receptor import get_receptor_ctl, worker_info, worker_cleanu
 from awx.main.consumers import emit_channel_notification
 from awx.main import analytics
 from awx.conf import settings_registry
-from awx.main.analytics.subsystem_metrics import Metrics
+from awx.main.analytics.subsystem_metrics import DispatcherMetrics
 
 from rest_framework.exceptions import PermissionDenied
 
@@ -113,7 +117,7 @@ def dispatch_startup():
     cluster_node_heartbeat()
     reaper.startup_reaping()
     reaper.reap_waiting(grace_period=0)
-    m = Metrics()
+    m = DispatcherMetrics()
     m.reset_values()
 
 
@@ -416,7 +420,7 @@ def handle_removed_image(remove_images=None):
 
 @task(queue=get_task_queuename)
 def cleanup_images_and_files():
-    _cleanup_images_and_files()
+    _cleanup_images_and_files(image_prune=True)
 
 
 @task(queue=get_task_queuename)
@@ -495,7 +499,7 @@ def inspect_established_receptor_connections(mesh_status):
     update_links = []
     for link in all_links:
         if link.link_state != InstanceLink.States.REMOVING:
-            if link.target.hostname in active_receptor_conns.get(link.source.hostname, {}):
+            if link.target.instance.hostname in active_receptor_conns.get(link.source.hostname, {}):
                 if link.link_state is not InstanceLink.States.ESTABLISHED:
                     link.link_state = InstanceLink.States.ESTABLISHED
                     update_links.append(link)
@@ -630,10 +634,18 @@ def cluster_node_heartbeat(dispatch_time=None, worker_tasks=None):
                 logger.error("Host {} last checked in at {}, marked as lost.".format(other_inst.hostname, other_inst.last_seen))
 
         except DatabaseError as e:
-            if 'did not affect any rows' in str(e):
-                logger.debug('Another instance has marked {} as lost'.format(other_inst.hostname))
+            cause = e.__cause__
+            if cause and hasattr(cause, 'sqlstate'):
+                sqlstate = cause.sqlstate
+                sqlstate_str = psycopg.errors.lookup(sqlstate)
+                logger.debug('SQL Error state: {} - {}'.format(sqlstate, sqlstate_str))
+
+                if sqlstate == psycopg.errors.NoData:
+                    logger.debug('Another instance has marked {} as lost'.format(other_inst.hostname))
+                else:
+                    logger.exception("Error marking {} as lost.".format(other_inst.hostname))
             else:
-                logger.exception('Error marking {} as lost'.format(other_inst.hostname))
+                logger.exception('No SQL state available.  Error marking {} as lost'.format(other_inst.hostname))
 
     # Run local reaper
     if worker_tasks is not None:
@@ -788,10 +800,19 @@ def update_inventory_computed_fields(inventory_id):
     try:
         i.update_computed_fields()
     except DatabaseError as e:
-        if 'did not affect any rows' in str(e):
-            logger.debug('Exiting duplicate update_inventory_computed_fields task.')
-            return
-        raise
+        # https://github.com/django/django/blob/eff21d8e7a1cb297aedf1c702668b590a1b618f3/django/db/models/base.py#L1105
+        # django raises DatabaseError("Forced update did not affect any rows.")
+
+        # if sqlstate is set then there was a database error and otherwise will re-raise that error
+        cause = e.__cause__
+        if cause and hasattr(cause, 'sqlstate'):
+            sqlstate = cause.sqlstate
+            sqlstate_str = psycopg.errors.lookup(sqlstate)
+            logger.error('SQL Error state: {} - {}'.format(sqlstate, sqlstate_str))
+            raise
+
+        # otherwise
+        logger.debug('Exiting duplicate update_inventory_computed_fields task.')
 
 
 def update_smart_memberships_for_inventory(smart_inventory):
@@ -946,3 +967,17 @@ def deep_copy_model_obj(model_module, model_name, obj_pk, new_obj_pk, user_pk, p
             permission_check_func(creater, copy_mapping.values())
     if isinstance(new_obj, Inventory):
         update_inventory_computed_fields.delay(new_obj.id)
+
+
+@task(queue=get_task_queuename)
+def periodic_resource_sync():
+    if not getattr(settings, 'RESOURCE_SERVER', None):
+        logger.debug("Skipping periodic resource_sync, RESOURCE_SERVER not configured")
+        return
+
+    with advisory_lock('periodic_resource_sync', wait=False) as acquired:
+        if acquired is False:
+            logger.debug("Not running periodic_resource_sync, another task holds lock")
+            return
+
+        SyncExecutor().run()

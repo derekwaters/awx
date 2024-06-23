@@ -12,11 +12,11 @@ import AssociateModal from 'components/AssociateModal';
 import ErrorDetail from 'components/ErrorDetail';
 import AlertModal from 'components/AlertModal';
 import useToast, { AlertVariant } from 'hooks/useToast';
-import { getQSConfig, parseQueryString, mergeParams } from 'util/qs';
+import { getQSConfig, parseQueryString } from 'util/qs';
 import { useLocation, useParams } from 'react-router-dom';
 import useRequest, { useDismissableError } from 'hooks/useRequest';
 import DataListToolbar from 'components/DataListToolbar';
-import { InstancesAPI } from 'api';
+import { InstancesAPI, ReceptorAPI } from 'api';
 import useExpanded from 'hooks/useExpanded';
 import useSelected from 'hooks/useSelected';
 import InstancePeerListItem from './InstancePeerListItem';
@@ -24,7 +24,7 @@ import InstancePeerListItem from './InstancePeerListItem';
 const QS_CONFIG = getQSConfig('peer', {
   page: 1,
   page_size: 20,
-  order_by: 'hostname',
+  order_by: 'pk',
 });
 
 function InstancePeerList({ setBreadcrumb }) {
@@ -47,18 +47,35 @@ function InstancePeerList({ setBreadcrumb }) {
       const [
         { data: detail },
         {
-          data: { results, count: itemNumber },
+          data: { results },
         },
         actions,
+        instances,
       ] = await Promise.all([
         InstancesAPI.readDetail(id),
         InstancesAPI.readPeers(id, params),
         InstancesAPI.readOptions(),
+        InstancesAPI.read(),
       ]);
+
+      const address_list = [];
+
+      for (let q = 0; q < results.length; q++) {
+        const receptor = results[q];
+        if (receptor.managed === true) continue;
+        const host = instances.data.results.filter(
+          (obj) => obj.id === receptor.instance
+        )[0];
+        const copy = receptor;
+        copy.hostname = host.hostname;
+        copy.node_type = host.node_type;
+        address_list.push(copy);
+      }
+
       return {
         instance: detail,
-        peers: results,
-        count: itemNumber,
+        peers: address_list,
+        count: address_list.length,
         relatedSearchableKeys: (actions?.data?.related_search_fields || []).map(
           (val) => val.slice(0, -8)
         ),
@@ -89,16 +106,50 @@ function InstancePeerList({ setBreadcrumb }) {
   const { selected, isAllSelected, handleSelect, clearSelected, selectAll } =
     useSelected(peers);
 
-  const fetchInstancesToAssociate = useCallback(
-    (params) =>
-      InstancesAPI.read(
-        mergeParams(params, {
-          ...{ not__id: id },
-          ...{ not__node_type: ['control', 'hybrid'] },
-          ...{ not__hostname: instance.peers },
-        })
-      ),
-    [id, instance]
+  const fetchPeersToAssociate = useCallback(
+    async (params) => {
+      const address_list = [];
+
+      // do not show this instance or instances that are already peered
+      // to this instance (reverse_peers)
+      const not_instances = instance.reverse_peers;
+      not_instances.push(instance.id);
+
+      params.not__instance = not_instances;
+      params.is_internal = false;
+      // do not show the current peers
+      if (instance.peers.length > 0) {
+        params.not__id__in = instance.peers.join(',');
+      }
+
+      const receptoraddresses = await ReceptorAPI.read(params);
+
+      // retrieve the instances that are associated with those receptor addresses
+      const instance_ids = receptoraddresses.data.results.map(
+        (obj) => obj.instance
+      );
+      const instance_ids_str = instance_ids.join(',');
+      const instances = await InstancesAPI.read({ id__in: instance_ids_str });
+
+      for (let q = 0; q < receptoraddresses.data.results.length; q++) {
+        const receptor = receptoraddresses.data.results[q];
+
+        const host = instances.data.results.filter(
+          (obj) => obj.id === receptor.instance
+        )[0];
+
+        const copy = receptor;
+        copy.hostname = host.hostname;
+        copy.node_type = host.node_type;
+        copy.canonical = copy.canonical.toString();
+        address_list.push(copy);
+      }
+
+      receptoraddresses.data.results = address_list;
+
+      return receptoraddresses;
+    },
+    [instance]
   );
 
   const {
@@ -108,17 +159,15 @@ function InstancePeerList({ setBreadcrumb }) {
   } = useRequest(
     useCallback(
       async (instancesPeerToAssociate) => {
-        const selected_hostname = instancesPeerToAssociate.map(
-          (obj) => obj.hostname
-        );
-        const new_peers = [
-          ...new Set([...instance.peers, ...selected_hostname]),
-        ];
+        const selected_peers = instancesPeerToAssociate.map((obj) => obj.id);
+
+        const new_peers = [...new Set([...instance.peers, ...selected_peers])];
         await InstancesAPI.update(instance.id, { peers: new_peers });
+
         fetchPeers();
         addToast({
           id: instancesPeerToAssociate,
-          title: t`${selected_hostname} added as a peer. Please be sure to run the install bundle for ${instance.hostname} again in order to see changes take effect.`,
+          title: t`Please be sure to run the install bundle for ${instance.hostname} again in order to see changes take effect.`,
           variant: AlertVariant.success,
           hasTimeout: true,
         });
@@ -133,17 +182,18 @@ function InstancePeerList({ setBreadcrumb }) {
     error: disassociateError,
   } = useRequest(
     useCallback(async () => {
-      const new_peers = [];
-      const selected_hostname = selected.map((obj) => obj.hostname);
-      for (let i = 0; i < instance.peers.length; i++) {
-        if (!selected_hostname.includes(instance.peers[i])) {
-          new_peers.push(instance.peers[i]);
-        }
+      let new_peers = instance.peers;
+
+      const selected_ids = selected.map((obj) => obj.id);
+
+      for (let i = 0; i < selected_ids.length; i++) {
+        new_peers = new_peers.filter((s_id) => s_id !== selected_ids[i]);
       }
       await InstancesAPI.update(instance.id, { peers: new_peers });
+
       fetchPeers();
       addToast({
-        title: t`${selected_hostname} removed. Please be sure to run the install bundle for ${instance.hostname} again in order to see changes take effect.`,
+        title: t`Peer removed. Please be sure to run the install bundle for ${instance.hostname} again in order to see changes take effect.`,
         variant: AlertVariant.success,
         hasTimeout: true,
       });
@@ -190,9 +240,11 @@ function InstancePeerList({ setBreadcrumb }) {
             <HeaderCell
               tooltip={t`Cannot run health check on hop nodes.`}
               sortKey="hostname"
-            >{t`Name`}</HeaderCell>
-            <HeaderCell sortKey="errors">{t`Status`}</HeaderCell>
+            >{t`Instance Name`}</HeaderCell>
+            <HeaderCell sortKey="address">{t`Address`}</HeaderCell>
+            <HeaderCell sortKey="port">{t`Port`}</HeaderCell>
             <HeaderCell sortKey="node_type">{t`Node Type`}</HeaderCell>
+            <HeaderCell sortKey="canonical">{t`Canonical`}</HeaderCell>
           </HeaderRow>
         }
         renderToolbar={(props) => (
@@ -218,7 +270,7 @@ function InstancePeerList({ setBreadcrumb }) {
                   key="disassociate"
                   onDisassociate={handlePeersDiassociate}
                   itemsToDisassociate={selected}
-                  modalTitle={t`Remove instance from peers?`}
+                  modalTitle={t`Remove peers?`}
                 />
               ),
             ]}
@@ -239,16 +291,19 @@ function InstancePeerList({ setBreadcrumb }) {
       {isModalOpen && (
         <AssociateModal
           header={t`Instances`}
-          fetchRequest={fetchInstancesToAssociate}
+          fetchRequest={fetchPeersToAssociate}
           isModalOpen={isModalOpen}
           onAssociate={handlePeerAssociate}
           onClose={() => setIsModalOpen(false)}
-          title={t`Select Instances`}
+          title={t`Select Peer Addresses`}
           optionsRequest={readInstancesOptions}
-          displayKey="hostname"
+          displayKey="address"
           columns={[
             { key: 'hostname', name: t`Name` },
+            { key: 'address', name: t`Address` },
+            { key: 'port', name: t`Port` },
             { key: 'node_type', name: t`Node Type` },
+            { key: 'protocol', name: t`Protocol` },
           ]}
         />
       )}
